@@ -49,6 +49,23 @@ class TestNumpyroSampler(object):
         assert len(result["logL_starts"]) == 3
         npt.assert_allclose(result["covariance"], self.cov, rtol=1e-4)
 
+    def test_map_parallel(self):
+        # the per-device path (one start per device, padded rounds) must match the
+        # one-at-a-time path
+        kwargs = dict(
+            args_init=np.array([1.0, 1.0]),
+            args_sigma=np.array([0.3, 0.3]),
+            num_starts=3,
+            tolerance=1e-12,
+            laplace=False,
+        )
+        result_parallel = self.sampler.map(parallel=True, **kwargs)
+        result_serial = self.sampler.map(parallel=False, **kwargs)
+        npt.assert_allclose(
+            result_parallel["logL_starts"], result_serial["logL_starts"], atol=1e-8
+        )
+        npt.assert_allclose(result_parallel["args"], self.mean, atol=1e-5)
+
     def test_map_from_gradient_singularity(self):
         # smooth logL written through |x|, whose gradient is NaN at exactly 0, like
         # the EPL ellipticity at e1 = e2 = 0

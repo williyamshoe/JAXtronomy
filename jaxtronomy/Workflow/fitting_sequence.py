@@ -612,6 +612,7 @@ class FittingSequence(object):
         sigma_scale=1,
         laplace=True,
         rng_seed=None,
+        parallel=None,
     ):
         """Maximum a posteriori fit with multi-start L-BFGS in numpyro's unbounded
         parameter space. The first start is the current parameter state; the others are
@@ -626,6 +627,8 @@ class FittingSequence(object):
         :param laplace: bool, also compute the Laplace (inverse Hessian) covariance,
             which is reported and seeds the HMC mass matrix if no SVI step follows
         :param rng_seed: int or None
+        :param parallel: bool or None, run the starts at the same time, one per
+            device (GPU); None does so whenever there is more than one device
         :return: ['MAP', samples (1, num_param), param_list, logL (1,), info dict]
         """
         sampler, args_init, args_sigma, param_list = self._numpyro_sampler()
@@ -637,6 +640,7 @@ class FittingSequence(object):
             tolerance=tolerance,
             laplace=laplace,
             rng_seed=self._rng_seed(rng_seed),
+            parallel=parallel,
         )
         self._update_state(result["args"])
         if result.get("covariance_unconstrained") is not None:

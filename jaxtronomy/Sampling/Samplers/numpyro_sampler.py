@@ -44,6 +44,7 @@ class NumpyroSampler(object):
             raise ValueError("every upper bound must be larger than its lower bound")
         self.num_param = len(self._lower)
         self._logL_chunk = None
+        self._lbfgs_pmap_cache = {}
 
     # ------------------------------------------------------------------
     # model and coordinate transforms
@@ -163,6 +164,7 @@ class NumpyroSampler(object):
         tolerance=1e-3,
         laplace=True,
         rng_seed=0,
+        parallel=None,
     ):
         """Maximum a posteriori estimate with multi-start L-BFGS.
 
@@ -180,6 +182,9 @@ class NumpyroSampler(object):
         :param laplace: bool, if True also returns the inverse Hessian of -logL at the
             MAP (the Laplace approximation of the posterior covariance)
         :param rng_seed: int, seed for the additional starts
+        :param parallel: bool or None, run the starts at the same time, one per
+            device (e.g. one per GPU), in rounds of the number of devices. None
+            does so whenever there is more than one device and more than one start
         :return: dict with ``args`` (best parameters), ``logL``, ``logL_starts`` (final
             logL of every start), ``num_iterations`` and, if ``laplace``,
             ``covariance`` (in the constrained parameters; None if the Hessian is
@@ -196,11 +201,32 @@ class NumpyroSampler(object):
             )
             starts += [self._clip_into_bounds(d) for d in draws]
 
+        num_devices = jax.local_device_count()
+        if parallel is None:
+            parallel = num_devices > 1 and len(starts) > 1
+        z_starts = [
+            self.to_unconstrained(self._finite_gradient_start(start, rng_seed + i))
+            for i, start in enumerate(starts)
+        ]
+        if parallel:
+            print(
+                "MAP: %d starts in parallel on %d devices" % (len(starts), num_devices),
+                flush=True,
+            )
+            runs = []
+            for first in range(0, len(z_starts), num_devices):
+                chunk = z_starts[first : first + num_devices]
+                n = len(chunk)
+                # pad the last round so every device gets a start; extras are dropped
+                padded = jnp.stack(chunk + [chunk[-1]] * (num_devices - n))
+                z_out, num_out = self._lbfgs_pmap(maxiter, tolerance)(padded)
+                runs += [(z_out[j], num_out[j]) for j in range(n)]
+        else:
+            runs = (self._lbfgs(z, maxiter, tolerance) for z in z_starts)
+
         best = None
         logL_starts, iterations = [], []
-        for i, start in enumerate(starts):
-            start = self._finite_gradient_start(start, rng_seed=rng_seed + i)
-            z, num_iter = self._lbfgs(self.to_unconstrained(start), maxiter, tolerance)
+        for i, (z, num_iter) in enumerate(runs):
             logL = float(-self._neg_logL_unconstrained(z))
             if not (np.all(np.isfinite(np.asarray(z))) and np.isfinite(logL)):
                 # a NaN step; jaxtronomy's logL of NaN parameters is not NaN, so
@@ -210,10 +236,11 @@ class NumpyroSampler(object):
             iterations.append(int(num_iter))
             print(
                 "MAP start %d/%d: logL = %.4f after %d iterations"
-                % (i + 1, len(starts), logL, num_iter)
+                % (i + 1, len(starts), logL, num_iter),
+                flush=True,
             )
             if np.isfinite(logL) and (best is None or logL > best[1]):
-                best = (z, logL)
+                best = (jnp.asarray(z), logL)
 
         if best is None:
             raise RuntimeError(
@@ -232,6 +259,19 @@ class NumpyroSampler(object):
 
     @partial(jax.jit, static_argnums=(0, 2))
     def _lbfgs(self, z_init, maxiter, tolerance):
+        return self._lbfgs_run(z_init, maxiter, tolerance)
+
+    def _lbfgs_pmap(self, maxiter, tolerance):
+        """L-BFGS mapped over devices: one start per device, each with its own
+        loop, so a start that converges early does not wait for the others."""
+        key = (maxiter, float(tolerance))
+        if key not in self._lbfgs_pmap_cache:
+            self._lbfgs_pmap_cache[key] = jax.pmap(
+                lambda z: self._lbfgs_run(z, maxiter, tolerance)
+            )
+        return self._lbfgs_pmap_cache[key]
+
+    def _lbfgs_run(self, z_init, maxiter, tolerance):
         opt = optax.lbfgs()
         loss = self._neg_logL_unconstrained
         value_and_grad = optax.value_and_grad_from_state(loss)
