@@ -1,5 +1,6 @@
 from jaxtronomy.Sampling.likelihood import Likelihood
 from jaxtronomy.Sampling.Samplers.optax import OptaxMinimizer
+from jaxtronomy.Sampling.Samplers.numpyro_sampler import NumpyroSampler
 from jaxtronomy.Sampling.sampler import Sampler
 
 from lenstronomy.Sampling.likelihood import Likelihood as Likelihood_lenstronomy
@@ -80,6 +81,9 @@ class FittingSequence(object):
             num_bands=len(self.multi_band_list),
         )
         self._mcmc_init_samples = None
+        # posterior covariance in numpyro's unbounded space from the last MAP (Laplace)
+        # or SVI step, with the parameter names it belongs to; seeds the HMC mass matrix
+        self._numpyro_covariance = None
         self._psf_iteration_memory = []
         self._psf_iteration_index = 0  # index of the sequence of the PSF iteration (how many times it is being run)
 
@@ -119,6 +123,9 @@ class FittingSequence(object):
                 "MultiNest",
                 "nested_sampling",
                 "Nautilus",
+                "MAP",
+                "SVI",
+                "HMC",
             ]:
                 self._updateManager.check_initial_state()
             if fitting_type == "restart":
@@ -233,9 +240,14 @@ class FittingSequence(object):
                 kwargs_result = self.optax(**kwargs)
                 self._updateManager.update_param_state(**kwargs_result)
                 chain_list.append([fitting_type, kwargs_result])
+            elif fitting_type in ["MAP", "SVI", "HMC"]:
+                method = {"MAP": self.map, "SVI": self.svi, "HMC": self.hmc}
+                output = method[fitting_type](**kwargs)
+                chain_list.append(output)
             else:
                 raise ValueError(
                     "fitting_sequence {} is not supported. Please use: 'PSO', 'SIMPLEX', 'optax', "
+                    "'MAP', 'SVI', 'HMC', "
                     "'MCMC' or 'emcee', 'zeus', 'Cobaya', "
                     "'dynesty', 'dyPolyChord',  'Multinest', 'Nautilus, '"
                     "'psf_iteration', 'restart', 'update_settings', 'calibrate_images' or "
@@ -550,6 +562,219 @@ class FittingSequence(object):
         print("Final parameters:", kwargs_result)
 
         return kwargs_result
+
+    # ------------------------------------------------------------------
+    # gradient-based inference with numpyro: MAP, SVI and HMC
+    # ------------------------------------------------------------------
+    def _numpyro_sampler(self):
+        """NumpyroSampler on the current likelihood and parameter bounds, with the
+        current parameter state, its spread, and the parameter names."""
+        param_class = self.param_class
+        args_lower = param_class.kwargs2args(*self._updateManager._lower_kwargs)
+        args_upper = param_class.kwargs2args(*self._updateManager._upper_kwargs)
+        sampler = NumpyroSampler(
+            self.likelihood_class.logL, args_lower=args_lower, args_upper=args_upper
+        )
+        args_init = np.array(
+            param_class.kwargs2args(**self._updateManager.parameter_state)
+        )
+        args_sigma = np.array(
+            param_class.kwargs2args(**self._updateManager.sigma_kwargs)
+        )
+        _, param_list = param_class.num_param()
+        return sampler, args_init, args_sigma, param_list
+
+    def _stored_covariance(self, param_list, step_name):
+        """Covariance left by the last MAP (Laplace) or SVI step, if it belongs to the
+        same sampled parameters."""
+        if self._numpyro_covariance is None:
+            return None
+        cov_param_list, cov = self._numpyro_covariance
+        if list(cov_param_list) != list(param_list):
+            print(
+                "%s: the sampled parameters changed since the last MAP/SVI step; "
+                "not using its covariance." % step_name
+            )
+            return None
+        return cov
+
+    @staticmethod
+    def _rng_seed(rng_seed):
+        if rng_seed is None:
+            return int(np.random.randint(0, 2**31 - 1))
+        return rng_seed
+
+    def map(
+        self,
+        num_starts=1,
+        maxiter=1000,
+        tolerance=1e-3,
+        sigma_scale=1,
+        laplace=True,
+        rng_seed=None,
+    ):
+        """Maximum a posteriori fit with multi-start L-BFGS in numpyro's unbounded
+        parameter space. The first start is the current parameter state; the others are
+        drawn around it with the initial spread (``kwargs_sigma``) times
+        ``sigma_scale``.
+
+        :param num_starts: int, number of L-BFGS runs
+        :param maxiter: int, maximum number of iterations per run
+        :param tolerance: float, a run stops when -logL improves by less than this
+            three iterations in a row
+        :param sigma_scale: float, scales the spread of the additional starts
+        :param laplace: bool, also compute the Laplace (inverse Hessian) covariance,
+            which is reported and seeds the HMC mass matrix if no SVI step follows
+        :param rng_seed: int or None
+        :return: ['MAP', samples (1, num_param), param_list, logL (1,), info dict]
+        """
+        sampler, args_init, args_sigma, param_list = self._numpyro_sampler()
+        result = sampler.map(
+            args_init,
+            args_sigma=args_sigma * sigma_scale,
+            num_starts=num_starts,
+            maxiter=maxiter,
+            tolerance=tolerance,
+            laplace=laplace,
+            rng_seed=self._rng_seed(rng_seed),
+        )
+        self._update_state(result["args"])
+        if result.get("covariance_unconstrained") is not None:
+            self._numpyro_covariance = (param_list, result["covariance_unconstrained"])
+
+        info = {"logL_starts": result["logL_starts"]}
+        for key in ["covariance", "covariance_unconstrained"]:
+            if result.get(key) is not None:
+                info[key] = result[key]
+        return [
+            "MAP",
+            result["args"][np.newaxis, :],
+            param_list,
+            np.array([result["logL"]]),
+            info,
+        ]
+
+    def svi(
+        self,
+        num_steps=5000,
+        learning_rate=1e-3,
+        num_particles=1,
+        init_scale=1e-3,
+        use_init_covariance=True,
+        num_samples=2000,
+        clip_norm=10.0,
+        rng_seed=None,
+        progress=True,
+    ):
+        """Stochastic variational inference with a full-rank Gaussian guide in
+        numpyro's unbounded space, started at the current parameter state (e.g. the
+        MAP). Updates the parameter state to the guide mean and stores the fitted
+        covariance to seed the HMC mass matrix.
+
+        :param use_init_covariance: bool, start the guide from the Laplace covariance
+            of a previous MAP step on the same parameters, if there is one; otherwise
+            from an isotropic Gaussian of width ``init_scale``
+        See :meth:`NumpyroSampler.svi` for the other arguments.
+
+        :return: ['SVI', samples (num_samples, num_param), param_list, logL, info dict]
+        """
+        sampler, args_init, _, param_list = self._numpyro_sampler()
+        init_cov = (
+            self._stored_covariance(param_list, "SVI") if use_init_covariance else None
+        )
+        result = sampler.svi(
+            args_init,
+            num_steps=num_steps,
+            learning_rate=learning_rate,
+            num_particles=num_particles,
+            init_scale=init_scale,
+            init_covariance_unconstrained=init_cov,
+            num_samples=num_samples,
+            clip_norm=clip_norm,
+            rng_seed=self._rng_seed(rng_seed),
+            progress=progress,
+        )
+        self._update_state(result["mean"])
+        self._numpyro_covariance = (param_list, result["covariance_unconstrained"])
+
+        info = {
+            key: result[key]
+            for key in ["losses", "mean", "loc_unconstrained", "covariance_unconstrained"]
+        }
+        return ["SVI", result["samples"], param_list, result["logL"], info]
+
+    def hmc(
+        self,
+        num_warmup=1000,
+        num_samples=1000,
+        num_chains=1,
+        chain_method="parallel",
+        use_init_covariance=True,
+        init_spread=1.0,
+        dense_mass=True,
+        target_accept_prob=0.8,
+        max_tree_depth=10,
+        thinning=1,
+        rhat_target=None,
+        check_every=200,
+        min_samples=200,
+        rng_seed=None,
+        progress=True,
+    ):
+        """Hamiltonian Monte Carlo (NUTS), started at the current parameter state. If a
+        previous MAP or SVI step on the same parameters left a covariance, it seeds the
+        mass matrix and spreads the chain starting points. Updates the parameter state
+        to the sample with the highest likelihood.
+
+        :param use_init_covariance: bool, use the covariance from a previous MAP or SVI
+            step; otherwise adaptation starts from the identity
+        See :meth:`NumpyroSampler.hmc` for the other arguments. With
+        ``chain_method='parallel'`` each chain runs on its own device (GPU). With
+        ``rhat_target`` (e.g. 1.01), sampling stops once the chains have converged and
+        ``num_samples`` is the maximum number of draws per chain.
+
+        :return: ['HMC', samples (num_chains, num_samples, num_param), param_list,
+            logL (num_chains, num_samples), info dict]
+        """
+        sampler, args_init, _, param_list = self._numpyro_sampler()
+        init_cov = (
+            self._stored_covariance(param_list, "HMC") if use_init_covariance else None
+        )
+        result = sampler.hmc(
+            args_init,
+            num_warmup=num_warmup,
+            num_samples=num_samples,
+            num_chains=num_chains,
+            chain_method=chain_method,
+            init_covariance_unconstrained=init_cov,
+            init_spread=init_spread,
+            dense_mass=dense_mass,
+            target_accept_prob=target_accept_prob,
+            max_tree_depth=max_tree_depth,
+            thinning=thinning,
+            rhat_target=rhat_target,
+            check_every=check_every,
+            min_samples=min_samples,
+            rng_seed=self._rng_seed(rng_seed),
+            progress=progress,
+        )
+        samples, logL = result["samples"], result["logL"]
+        kwargs_result = self.best_fit_from_samples(samples, logL)
+        self._updateManager.update_param_state(**kwargs_result)
+        self._mcmc_init_samples = samples.reshape(-1, samples.shape[-1])
+
+        info = {
+            key: result[key]
+            for key in [
+                "diverging",
+                "num_steps",
+                "r_hat",
+                "n_eff",
+                "inverse_mass_matrix",
+                "step_size",
+            ]
+        }
+        return ["HMC", samples, param_list, logL, info]
 
     def pso(
         self,
